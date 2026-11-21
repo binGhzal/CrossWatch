@@ -197,9 +197,7 @@ def _retry_deliveries(group: WatchGroup) -> None:
                 return
             try:
                 runner.dispatcher.retry_pending(group.retry_stop)
-                replay = getattr(runner.sink, "retry_completion", None)
-                if replay and not group.retry_stop.is_set():
-                    replay()
+                runner.dispatcher.retry_persisted(runner.sink, group.retry_stop)
             except Exception as exc:
                 _log(f"Route retry failed: {exc}", "ERROR")
 

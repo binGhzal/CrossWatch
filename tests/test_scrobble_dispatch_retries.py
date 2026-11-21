@@ -321,12 +321,12 @@ def test_floppy_queued_viewings_keep_first_stop_time_and_following_restart(setup
     second_time = '2026-01-02T12:03:04.654321Z'
     first = event(action='stop', progress=99, observed_at=first_time, raw={'original': True})
     try:
-        assert dispatcher.dispatch(first)
-        assert dispatcher.dispatch(replace(first, observed_at='2026-01-02T10:01:09Z'))
+        assert not dispatcher.dispatch(first)
+        assert not dispatcher.dispatch(replace(first, observed_at='2026-01-02T10:01:09Z'))
         # A new viewing reuses the provider session key; its start must not replace the old stop.
         assert dispatcher.dispatch(event(action='start', progress=1))
         assert dispatcher.dispatch(event(action='start', progress=20))
-        assert dispatcher.dispatch(event(action='stop', progress=99, observed_at=second_time))
+        assert not dispatcher.dispatch(event(action='stop', progress=99, observed_at=second_time))
         first.ids['tmdb'] = 'caller-mutated'
         first.raw['original'] = False
     finally:
@@ -353,7 +353,7 @@ def test_floppy_unadmitted_stop_retries_before_later_same_session_viewing(setup)
     first = event(action='stop', progress=99, observed_at='2026-01-02T10:00:00Z')
     assert not dispatcher.dispatch(first)
     assert dispatcher.dispatch(event(action='start', progress=1))
-    assert dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T12:00:00Z'))
+    assert not dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T12:00:00Z'))
     now[0] += 30
     for _ in range(4):
         dispatcher.retry_pending()
@@ -381,7 +381,7 @@ def test_floppy_pending_count_is_bounded_without_evicting_the_first_completion(s
     try:
         results = [dispatcher.dispatch(event(action='stop', progress=99, raw={'notification': n},
                                            observed_at=f'2026-01-02T10:00:{n:02d}Z')) for n in range(40)]
-        assert sum(results) == 31 and results[0] and not results[-1]
+        assert not any(results)  # Even retained stops have not reached durable sink admission.
         head = next(iter(dispatcher._pending.values()))[1]
         assert head.observed_at == '2026-01-02T10:00:00Z'
         assert len(dispatcher._pending) + sum(map(len, dispatcher._pending_tail.values())) == 31
@@ -506,7 +506,7 @@ def test_floppy_global_bound_reserves_failed_inflight_completion_without_evictio
     assert entered.wait(1)
     try:
         for n in range(1023):
-            assert dispatcher.dispatch(event(action='stop', progress=99, session_key=str(n)))
+            assert not dispatcher.dispatch(event(action='stop', progress=99, session_key=str(n)))
         assert not dispatcher.dispatch(event(action='stop', progress=99, session_key='overflow'))
     finally:
         release.set()
@@ -546,3 +546,39 @@ def test_floppy_destination_change_cancels_old_fifo_without_retargeting_tail(set
     dispatcher.retry_pending()
     assert calls == [('fixture-token', 'old-inflight', 'start'), ('replacement-fixture-token', 'new-view', 'start')]
     assert not dispatcher._pending and not dispatcher._pending_tail and not dispatcher._pending_ordered
+
+
+def test_persisted_retry_waits_for_inflight_and_ordered_pending_events(setup):
+    cfg, now = setup
+    cfg['scrobble']['watch']['route_sink'] = 'floppy'
+    cfg['floppy'] = {'server_url': 'https://fixture.invalid', 'api_token': 'fixture-token', 'verify_ssl': True}
+    entered, release = Event(), Event()
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append(('live', ev.action))
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(3)
+            return {'ok': True}
+        def retry_completion(self, can_retry=None):
+            if can_retry is None or can_retry(event(action='stop', progress=99)):
+                calls.append(('persisted', 'stop'))
+    sink = Sink()
+    dispatcher = Dispatcher([sink], cfg_provider=lambda: cfg)
+    first = Thread(target=lambda: dispatcher.dispatch(event(session_key='other')))
+    first.start()
+    assert entered.wait(1)
+    try:
+        dispatcher.retry_persisted(sink)
+        assert not dispatcher.dispatch(event(action='stop', progress=99))
+        dispatcher.retry_persisted(sink)
+        assert calls == [('live', 'start')]
+    finally:
+        release.set()
+        first.join(2)
+    dispatcher.retry_persisted(sink)
+    assert calls == [('live', 'start')]
+    dispatcher.retry_pending()
+    dispatcher.retry_persisted(sink)
+    assert calls == [('live', 'start'), ('live', 'stop'), ('persisted', 'stop')]

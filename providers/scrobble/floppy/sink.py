@@ -8,6 +8,7 @@ import sqlite3
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +30,12 @@ try:
     from _logging import log as BASE_LOG
 except Exception:
     BASE_LOG = None
+
+
+@dataclass(frozen=True)
+class _QueuedStart:
+    scope: str
+    session: str
 
 
 class _Adapter:
@@ -343,7 +350,7 @@ class FloppySink(ScrobbleSink):
         self._record_success(ev, cfg, "stop", ev.progress, True)
         return {"ok": True}
 
-    def retry_completion(self):
+    def retry_completion(self, can_retry=None):
         now = time.monotonic()
         if now < self._poll_after:
             return
@@ -355,14 +362,60 @@ class FloppySink(ScrobbleSink):
         view = self._view(cfg)
         if not is_configured(view) or not self._guarded_view(view):
             return
-        row = completions.next_due(self._scope(cfg, view))
+        def event_for(row):
+            fields = json.loads(row["event"])
+            group = fields.pop("group_delivery", None)
+            raw = {"_cw_episode_group_delivery": group} if group else {}
+            return ScrobbleEvent(action="stop", raw=raw, **fields)
+
+        allowed = (lambda row: can_retry(event_for(row))) if can_retry is not None else None
+        row = completions.next_due(self._scope(cfg, view), allowed)
         if row is None:
             return
-        fields = json.loads(row["event"])
-        group = fields.pop("group_delivery", None)
-        raw = {"_cw_episode_group_delivery": group} if group else {}
-        ev = ScrobbleEvent(action="stop", raw=raw, **fields)
+        ev = event_for(row)
         self._deliver(row, ev, cfg, view)
+
+    def _completion_session(self, ev, cfg, coords):
+        watch = (cfg.get("scrobble") or {}).get("watch") or {}
+        return completions.fingerprint([_route_source(cfg), watch.get("route_id"),
+                                       watch.get("route_effective_profile_id"), self._instance_id,
+                                       ev.server_uuid, ev.session_key, ev.account, coords])
+
+    def admit_for_queue(self, ev, cfg=None):
+        """Commit a supported stop before acknowledging its volatile dispatch queue."""
+        cfgd = self._cfg(cfg)
+        view = self._view(cfgd)
+        body = _payload(ev, _watched_at(cfgd))
+        complete = body and body.get("action") == "stop" and body.get("completed") is True
+        start = body and body.get("action") == "start" and _clamp(ev.progress) <= 2
+        if not complete and not start:
+            return ev, ev.action != "stop"
+        # Group expansion/resolution still belongs to the ordinary sink call. It
+        # cannot be acknowledged while only the unsplit notification is in RAM.
+        if (ev.raw or {}).get("_cw_episode_group"):
+            return ev, False
+        coords = completions.target(ev) if self._guarded_view(view) and is_configured(view) else None
+        if not coords:
+            return ev, False
+        scope = self._scope(cfgd, view)
+        session = self._completion_session(ev, cfgd, coords)
+        try:
+            if complete:
+                if not completions.current_observation(body["played_at"]):
+                    return ev, False
+                row = completions.remember(scope, session, ev, body, coords)
+                if row["scope"] != scope:
+                    _log("scrobble failed status=None reason=completion_route_changed", "ERROR")
+                    return ev, False
+                return ev, True
+            marker = _QueuedStart(scope, session)
+            if ev._floppy_queue_start != marker:
+                completions.new_session(session)
+                ev = replace(ev, _floppy_queue_start=marker)
+            return ev, True
+        except (LocalDatabaseError, sqlite3.Error):
+            _log("scrobble failed status=None reason=completion_journal_unavailable", "ERROR")
+            return ev, False
 
     def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
         cfgd = self._cfg(cfg)
@@ -380,12 +433,9 @@ class FloppySink(ScrobbleSink):
         coords = completions.target(ev) if self._guarded_view(view) else None
         if coords and (is_complete_stop or (body["action"] == "start" and progress <= 2)):
             scope = self._scope(cfgd, view)
-            watch = (cfgd.get("scrobble") or {}).get("watch") or {}
             # The source identity survives a token rotation or a URL change. The separate
             # scope pins any outstanding request to its original destination.
-            session = completions.fingerprint([_route_source(cfgd), watch.get("route_id"),
-                                               watch.get("route_effective_profile_id"), self._instance_id,
-                                               ev.server_uuid, ev.session_key, ev.account, coords])
+            session = self._completion_session(ev, cfgd, coords)
             try:
                 if is_complete_stop:
                     if not completions.current_observation(body["played_at"]):
@@ -396,7 +446,8 @@ class FloppySink(ScrobbleSink):
                         _log("scrobble failed status=None reason=completion_route_changed", "ERROR")
                         return {"ok": False, "error": "completion_route_changed", "retryable": False}
                     return self._deliver(row, ev, cfgd, view)
-                completions.new_session(session)
+                if ev._floppy_queue_start != _QueuedStart(scope, session):
+                    completions.new_session(session)
             except (LocalDatabaseError, sqlite3.Error):
                 _log("scrobble failed status=None reason=completion_journal_unavailable", "ERROR")
                 return {"ok": False, "error": "completion_journal_unavailable", "retryable": True}

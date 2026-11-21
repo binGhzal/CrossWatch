@@ -126,14 +126,18 @@ def phase_for(event_id: str) -> str | None:
     return row["phase"] if row else None
 
 
-def next_due(scope: str) -> Row | None:
+def next_due(scope: str, accept=None) -> Row | None:
     now = time.time()
     c = journal()
-    return c.execute(
+    cursor = c.execute(
         """SELECT * FROM floppy_completions WHERE scope=? AND phase IN ('probe','guarded')
-        AND next_try <= ? AND created >= ? ORDER BY next_try LIMIT 1""",
+        AND next_try <= ? AND created >= ? ORDER BY next_try""",
         (scope, now, now - RETRY_WINDOW),
-    ).fetchone()
+    )
+    try:
+        return next((row for row in cursor if accept is None or accept(row)), None)
+    finally:
+        cursor.close()
 
 
 def transition(row: Row, old: str, new: str) -> bool:

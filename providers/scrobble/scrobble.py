@@ -11,7 +11,7 @@ import threading
 import hashlib
 from collections import OrderedDict
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Iterable, Literal, Protocol
 
@@ -258,6 +258,7 @@ class ScrobbleEvent:
     position_ms: int | None = None
     duration_ms: int | None = None
     observed_at: str | None = None
+    _floppy_queue_start: Any = field(default=None, repr=False, compare=False)
 
 
 class ScrobbleSink(Protocol):
@@ -450,6 +451,7 @@ class Dispatcher:
         self._pending_tail: dict[str, list[tuple[float, ScrobbleEvent]]] = {}
         self._config_identity = ""
         self._inflight: set[int] = set()
+        self._unprepared_inflight: set[str] = set()
         self._failed_ids: OrderedDict[str, dict[str, str]] = OrderedDict()
 
     def _send_sink(self, sink: Any, ev: ScrobbleEvent, cfg: dict[str, Any]) -> Any:
@@ -774,6 +776,28 @@ class Dispatcher:
             if time.monotonic() - started >= 1.0:
                 break
 
+    def retry_persisted(self, sink: Any, cancelled: threading.Event | None = None) -> None:
+        replay = getattr(sink, "retry_completion", None)
+        if not callable(replay):
+            return
+        def stream(event):
+            identity = event.session_key or [event.title, event.year]
+            return json.dumps([event.server_uuid, event.account, identity], sort_keys=True)
+
+        with self._dispatch_lock:
+            if id(sink) in self._inflight or (cancelled is not None and cancelled.is_set()):
+                return
+            # Preserve ordering within a source session, without starving another
+            # session whose request already reached the durable journal.
+            blocked = {stream(event) for key, (_, event) in self._pending.items()
+                       if self._session_key(sink, event) == key}
+            self._inflight.add(id(sink))
+        try:
+            replay(can_retry=lambda event: stream(event) not in blocked)
+        finally:
+            with self._dispatch_lock:
+                self._inflight.discard(id(sink))
+
     def _advance_pending(self, sk: str) -> None:
         self._retry_after.pop(sk, None)
         tail = self._pending_tail.get(sk)
@@ -830,6 +854,24 @@ class Dispatcher:
             self._pending_tail.pop(expired, None)
             self._pending_ordered.discard(expired)
             self._retry_after.pop(expired, None)
+        return True
+
+    def _admit_floppy_pending(self, sink: Any, sk: str, cfg: dict[str, Any]) -> bool:
+        prepare = getattr(sink, "admit_for_queue", None)
+        if not callable(prepare):
+            return False
+        entries = [self._pending[sk], *self._pending_tail.get(sk, [])]
+        for index, (created, event) in enumerate(entries):
+            try:
+                prepared, admitted = prepare(event, cfg=cfg)
+            except Exception:
+                return False
+            if not admitted:
+                return False
+            if index == 0:
+                self._pending[sk] = (created, prepared)
+            else:
+                self._pending_tail[sk][index - 1] = (created, prepared)
         return True
 
     def _failed_sink(self, sk: str, ev: ScrobbleEvent, *, ordered: bool = False) -> None:
@@ -913,6 +955,7 @@ class Dispatcher:
         sent = False
         failed = False
         queued = False
+        unadmitted_completion = False
         for s in self._sinks:
             sk = self._session_key(s, ev)
             ordered = watch.get("route_sink") == "floppy"
@@ -927,11 +970,17 @@ class Dispatcher:
                         admitted = self._queue_pending(sk, ev, ordered=ordered)
                         self._retry_after.setdefault(sk, (time.monotonic(), 0))
                     queued = queued or admitted
+                    durable = (admitted and ordered and sk not in self._unprepared_inflight
+                               and self._admit_floppy_pending(s, sk, cfg))
+                    unadmitted_completion = unadmitted_completion or (admitted and ordered and ev.action == "stop" and not durable)
                     failed = failed or not admitted
                     continue
                 if ordered and retry_key is None and sk in self._pending:
                     admitted = self._queue_pending(sk, ev, ordered=True)
                     queued = queued or admitted
+                    durable = (admitted and ordered and sk not in self._unprepared_inflight
+                               and self._admit_floppy_pending(s, sk, cfg))
+                    unadmitted_completion = unadmitted_completion or (admitted and ordered and ev.action == "stop" and not durable)
                     failed = failed or not admitted
                     continue
                 if ordered and retry_key is None:
@@ -955,6 +1004,20 @@ class Dispatcher:
                     if retry_key is not None:
                         self._advance_pending(sk)
                     continue
+                if ordered:
+                    prepare = getattr(s, "admit_for_queue", None)
+                    if callable(prepare):
+                        # Commit the first supported viewing (or rearm its start)
+                        # before another notification can pass this in-flight gate.
+                        # Network delivery and enrichment remain outside the lock.
+                        try:
+                            ev, admitted = prepare(ev, cfg=cfg)
+                        except Exception:
+                            admitted = False
+                        if not admitted:
+                            # Keep later same-session starts/stops in RAM until
+                            # this first local stage or its ordinary send resolves.
+                            self._unprepared_inflight.add(sk)
                 self._inflight.add(id(s))
             delivered = False
             try:
@@ -1037,12 +1100,13 @@ class Dispatcher:
             finally:
                 with self._dispatch_lock:
                     self._inflight.discard(id(s))
+                    self._unprepared_inflight.discard(sk)
                     if not delivered and identity == self._config_identity:
                         self._last_action.pop(sk, None)
                         self._last_progress.pop(sk, None)
                         self._debounce.pop(f"{sk}|pause", None)
 
-        return not failed and (sent or queued or not self._sinks)
+        return not (failed or unadmitted_completion) and (sent or queued or not self._sinks)
 
 
 __all__ = (
