@@ -6,7 +6,7 @@ from __future__ import annotations
 import sqlite3
 import time
 
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 
 ID_KEYS = (
     "tmdb",
@@ -682,6 +682,12 @@ def apply_schema(conn: sqlite3.Connection) -> int:
         conn.execute(_CREATE_ACTIVITY_EVENTS)
         conn.execute(_CREATE_ACTIVITY_EVENT_IDS)
         conn.execute(_CREATE_TTL_DEDUPE_ENTRIES)
+        conn.execute("""CREATE TABLE IF NOT EXISTS floppy_completions (
+            event_id TEXT PRIMARY KEY, scope TEXT NOT NULL, session TEXT, created REAL NOT NULL,
+            phase TEXT NOT NULL, request TEXT NOT NULL, event TEXT NOT NULL, target TEXT NOT NULL,
+            observation TEXT NOT NULL UNIQUE, next_try REAL NOT NULL, attempts INTEGER NOT NULL, UNIQUE(session)
+        )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_floppy_retry ON floppy_completions(scope,phase,next_try)")
         conn.execute(_CREATE_SYNC_RUN_REPORTS)
         _ensure_column(conn, "sync_run_reports", "pair_summary_json", "TEXT")
         conn.execute(_CREATE_SYNC_RUN_TIMELINE)

@@ -294,3 +294,255 @@ def test_sink_interruption_always_releases_inflight_and_allows_redelivery(setup,
     assert not dispatcher._inflight
     assert dispatcher.dispatch(event())
     assert not dispatcher._pending
+
+
+def _floppy_queue_config(cfg):
+    cfg['scrobble']['watch']['route_sink'] = 'floppy'
+    cfg['floppy'] = {'server_url': 'https://fixture.invalid', 'api_token': 'fixture-token', 'verify_ssl': True}
+
+
+def test_floppy_queued_viewings_keep_first_stop_time_and_following_restart(setup):
+    cfg, _ = setup
+    _floppy_queue_config(cfg)
+    entered, release = Event(), Event()
+    received = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            received.append(ev)
+            if len(received) == 1:
+                entered.set()
+                assert release.wait(3)
+            return {'ok': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    blocker = Thread(target=lambda: dispatcher.dispatch(event(session_key='other')))
+    blocker.start()
+    assert entered.wait(1)
+    first_time = '2026-01-02T10:01:02.123456Z'
+    second_time = '2026-01-02T12:03:04.654321Z'
+    first = event(action='stop', progress=99, observed_at=first_time, raw={'original': True})
+    try:
+        assert dispatcher.dispatch(first)
+        assert dispatcher.dispatch(replace(first, observed_at='2026-01-02T10:01:09Z'))
+        # A new viewing reuses the provider session key; its start must not replace the old stop.
+        assert dispatcher.dispatch(event(action='start', progress=1))
+        assert dispatcher.dispatch(event(action='start', progress=20))
+        assert dispatcher.dispatch(event(action='stop', progress=99, observed_at=second_time))
+        first.ids['tmdb'] = 'caller-mutated'
+        first.raw['original'] = False
+    finally:
+        release.set()
+        blocker.join(2)
+    for _ in range(5):
+        dispatcher.retry_pending()
+    plays = [e for e in received if e.session_key == 'session']
+    assert [(e.action, e.progress) for e in plays] == [('stop', 99), ('start', 1), ('start', 20), ('stop', 99)]
+    assert [e.observed_at for e in plays if e.action == 'stop'] == [first_time, second_time]
+    assert plays[0].ids == {'tmdb': '10'} and plays[0].raw['original'] is True
+    assert not dispatcher._pending and not dispatcher._pending_tail
+
+
+def test_floppy_unadmitted_stop_retries_before_later_same_session_viewing(setup):
+    cfg, now = setup
+    _floppy_queue_config(cfg)
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append(ev)
+            return {'ok': len(calls) > 1, 'retryable': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    first = event(action='stop', progress=99, observed_at='2026-01-02T10:00:00Z')
+    assert not dispatcher.dispatch(first)
+    assert dispatcher.dispatch(event(action='start', progress=1))
+    assert dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T12:00:00Z'))
+    now[0] += 30
+    for _ in range(4):
+        dispatcher.retry_pending()
+    assert [(e.action, e.observed_at) for e in calls] == [
+        ('stop', first.observed_at), ('stop', first.observed_at), ('start', None), ('stop', '2026-01-02T12:00:00Z')]
+    assert not dispatcher._pending and not dispatcher._pending_tail
+
+
+def test_floppy_pending_count_is_bounded_without_evicting_the_first_completion(setup):
+    cfg, _ = setup
+    _floppy_queue_config(cfg)
+    entered, release = Event(), Event()
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append(ev)
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(3)
+            return {'ok': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    blocker = Thread(target=lambda: dispatcher.dispatch(event(session_key='other')))
+    blocker.start()
+    assert entered.wait(1)
+    try:
+        results = [dispatcher.dispatch(event(action='stop', progress=99, raw={'notification': n},
+                                           observed_at=f'2026-01-02T10:00:{n:02d}Z')) for n in range(40)]
+        assert sum(results) == 31 and results[0] and not results[-1]
+        head = next(iter(dispatcher._pending.values()))[1]
+        assert head.observed_at == '2026-01-02T10:00:00Z'
+        assert len(dispatcher._pending) + sum(map(len, dispatcher._pending_tail.values())) == 31
+    finally:
+        release.set()
+        blocker.join(2)
+
+
+def test_floppy_pending_stop_does_not_expire_before_sink_admission(setup):
+    cfg, now = setup
+    _floppy_queue_config(cfg)
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append(ev)
+            return {'ok': len(calls) > 1, 'retryable': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    original = event(action='stop', progress=99, observed_at='2026-01-02T10:00:00Z')
+    dispatcher.dispatch(original)
+    now[0] += 3601
+    dispatcher.retry_pending()
+    assert len(calls) == 2 and calls[-1].observed_at == original.observed_at
+    assert not dispatcher._pending
+
+
+def test_non_floppy_busy_sink_retains_existing_latest_event_coalescing(setup):
+    cfg, _ = setup
+    entered, release = Event(), Event()
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append((ev.session_key, ev.action))
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(3)
+            return {'ok': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    blocker = Thread(target=lambda: dispatcher.dispatch(event(session_key='other')))
+    blocker.start()
+    assert entered.wait(1)
+    try:
+        dispatcher.dispatch(event(action='stop', progress=99))
+        dispatcher.dispatch(event(action='start', progress=1))
+    finally:
+        release.set()
+        blocker.join(2)
+    dispatcher.retry_pending()
+    assert calls == [('other', 'start'), ('session', 'start')]
+    assert not dispatcher._pending_ordered and not dispatcher._pending_tail
+
+
+def test_floppy_repeated_failure_keeps_head_ahead_of_queued_new_view(setup):
+    cfg, now = setup
+    _floppy_queue_config(cfg)
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append((ev.action, ev.observed_at))
+            return {'ok': len(calls) > 2, 'retryable': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    old = event(action='stop', progress=99, observed_at='2026-01-02T10:00:00Z')
+    dispatcher.dispatch(old)
+    dispatcher.dispatch(event(action='start', progress=1))
+    dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T12:00:00Z'))
+    now[0] += 30
+    dispatcher.retry_pending()
+    now[0] += 60
+    for _ in range(4):
+        dispatcher.retry_pending()
+    assert calls == [('stop', old.observed_at)] * 3 + [('start', None), ('stop', '2026-01-02T12:00:00Z')]
+    assert not dispatcher._pending and not dispatcher._pending_tail
+
+
+def test_floppy_failed_inflight_start_precedes_its_queued_completion(setup):
+    cfg, now = setup
+    _floppy_queue_config(cfg)
+    entered, release = Event(), Event()
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append((ev.action, ev.progress))
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(3)
+                return {'ok': False, 'retryable': True}
+            return {'ok': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    first = Thread(target=lambda: dispatcher.dispatch(event(action='start', progress=1)))
+    first.start()
+    assert entered.wait(1)
+    try:
+        dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T10:00:00Z'))
+        dispatcher.dispatch(event(action='start', progress=1))
+        dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T12:00:00Z'))
+    finally:
+        release.set()
+        first.join(2)
+    now[0] += 30
+    for _ in range(5):
+        dispatcher.retry_pending()
+    assert calls == [('start', 1), ('start', 1), ('stop', 99), ('start', 1), ('stop', 99)]
+    assert not dispatcher._pending and not dispatcher._pending_tail
+
+
+def test_floppy_global_bound_reserves_failed_inflight_completion_without_eviction(setup, monkeypatch):
+    cfg, _ = setup
+    _floppy_queue_config(cfg)
+    monkeypatch.setattr('cw_platform.event_archive.playback_recorder.record_playback', lambda *a, **k: None)
+    entered, release = Event(), Event()
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append(ev)
+            entered.set()
+            assert release.wait(3)
+            return {'ok': False, 'retryable': True}
+    sink = Sink()
+    dispatcher = Dispatcher([sink], cfg_provider=lambda: cfg)
+    original = event(action='stop', progress=99, session_key='original', observed_at='2026-01-02T10:00:00Z')
+    first = Thread(target=lambda: dispatcher.dispatch(original))
+    first.start()
+    assert entered.wait(1)
+    try:
+        for n in range(1023):
+            assert dispatcher.dispatch(event(action='stop', progress=99, session_key=str(n)))
+        assert not dispatcher.dispatch(event(action='stop', progress=99, session_key='overflow'))
+    finally:
+        release.set()
+        first.join(2)
+    assert len(dispatcher._pending) == 1024
+    assert dispatcher._session_key(sink, original) in dispatcher._pending
+    assert dispatcher._pending[dispatcher._session_key(sink, original)][1].observed_at == original.observed_at
+    assert not dispatcher.dispatch(event(action='stop', progress=99, session_key='still-full'))
+    assert len(calls) == 1 and len(dispatcher._pending) == 1024
+
+
+def test_floppy_destination_change_cancels_old_fifo_without_retargeting_tail(setup):
+    cfg, _ = setup
+    _floppy_queue_config(cfg)
+    entered, release = Event(), Event()
+    calls = []
+    class Sink:
+        def send(self, ev, cfg=None):
+            calls.append((cfg['floppy']['api_token'], ev.session_key, ev.action))
+            if len(calls) == 1:
+                entered.set()
+                assert release.wait(3)
+            return {'ok': True}
+    dispatcher = Dispatcher([Sink()], cfg_provider=lambda: cfg)
+    first = Thread(target=lambda: dispatcher.dispatch(event(session_key='old-inflight')))
+    first.start()
+    assert entered.wait(1)
+    try:
+        dispatcher.dispatch(event(action='stop', progress=99, observed_at='2026-01-02T10:00:00Z'))
+        dispatcher.dispatch(event(action='start', progress=1))
+        assert dispatcher._pending_tail
+        cfg['floppy']['api_token'] = 'replacement-fixture-token'
+        assert dispatcher.dispatch(event(session_key='new-view', action='start', progress=1))
+    finally:
+        release.set()
+        first.join(2)
+    dispatcher.retry_pending()
+    assert calls == [('fixture-token', 'old-inflight', 'start'), ('replacement-fixture-token', 'new-view', 'start')]
+    assert not dispatcher._pending and not dispatcher._pending_tail and not dispatcher._pending_ordered

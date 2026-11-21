@@ -10,7 +10,8 @@ import time
 import threading
 import hashlib
 from collections import OrderedDict
-from dataclasses import dataclass
+from copy import deepcopy
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Literal, Protocol
 
@@ -256,6 +257,7 @@ class ScrobbleEvent:
     raw: dict[str, Any]
     position_ms: int | None = None
     duration_ms: int | None = None
+    observed_at: str | None = None
 
 
 class ScrobbleSink(Protocol):
@@ -444,6 +446,8 @@ class Dispatcher:
         self._retry_after: dict[str, tuple[float, int]] = {}
         self._dispatch_lock = threading.RLock()
         self._pending: OrderedDict[str, tuple[float, ScrobbleEvent]] = OrderedDict()
+        self._pending_ordered: set[str] = set()
+        self._pending_tail: dict[str, list[tuple[float, ScrobbleEvent]]] = {}
         self._config_identity = ""
         self._inflight: set[int] = set()
         self._failed_ids: OrderedDict[str, dict[str, str]] = OrderedDict()
@@ -754,9 +758,8 @@ class Dispatcher:
             for sk, (created, ev) in list(self._pending.items()):
                 if cancelled is not None and cancelled.is_set():
                     return
-                if now - created >= 3600:
-                    self._pending.pop(sk, None)
-                    self._retry_after.pop(sk, None)
+                if now - created >= 3600 and sk not in self._pending_ordered:
+                    self._advance_pending(sk)
                     continue
                 if now >= self._retry_after.get(sk, (0.0, 0))[0]:
                     due.append((sk, ev))
@@ -771,22 +774,81 @@ class Dispatcher:
             if time.monotonic() - started >= 1.0:
                 break
 
-    def _queue_pending(self, sk: str, ev: ScrobbleEvent) -> None:
+    def _advance_pending(self, sk: str) -> None:
+        self._retry_after.pop(sk, None)
+        tail = self._pending_tail.get(sk)
+        if tail:
+            self._pending[sk] = tail.pop(0)
+            if not tail:
+                self._pending_tail.pop(sk, None)
+            self._retry_after[sk] = (time.monotonic(), 0)
+        else:
+            self._pending.pop(sk, None)
+            self._pending_ordered.discard(sk)
+
+    def _queue_pending(self, sk: str, ev: ScrobbleEvent, *, ordered: bool = False) -> bool:
         now = time.monotonic()
+        if ordered:
+            current = self._pending.get(sk)
+            if current and current[1] is ev:
+                return True
+            tail = self._pending_tail.get(sk, [])
+            last = tail[-1] if tail else current
+            if last:
+                previous = last[1]
+                if previous is ev or replace(ev, observed_at=previous.observed_at) == previous:
+                    return True
+                # Coalesce progress reports, never a stop or a new near-zero start.
+                same_band = (previous.progress <= 2) == (ev.progress <= 2)
+                if previous.action == ev.action and (ev.action == "pause" or (ev.action == "start" and same_band)):
+                    if ev.action == "start" and ev.progress <= 2:
+                        return True
+                    update = (last[0], deepcopy(ev))
+                    if tail:
+                        tail[-1] = update
+                    else:
+                        self._pending[sk] = update
+                    return True
+            # Reserve a slot for each in-flight event if its attempt needs retrying.
+            # Count bounds keep an unadmitted stop without expiring its original time.
+            count = len(self._pending) + sum(len(v) for v in self._pending_tail.values())
+            reserve = len(self._inflight)
+            if count >= 1024 - reserve or (int(current is not None) + len(tail)) >= 32 - int(reserve > 0):
+                _log("Floppy pending delivery queue is full; event was not admitted", "ERROR")
+                return False
+            entry = (now, deepcopy(ev))
+            self._pending_ordered.add(sk)
+            if current:
+                self._pending_tail.setdefault(sk, []).append(entry)
+            else:
+                self._pending[sk] = entry
+            return True
         self._pending[sk] = (self._pending.get(sk, (now, ev))[0], ev)
         self._pending.move_to_end(sk)
         if len(self._pending) > 1024:
             expired, _ = self._pending.popitem(last=False)
+            self._pending_tail.pop(expired, None)
+            self._pending_ordered.discard(expired)
             self._retry_after.pop(expired, None)
+        return True
 
-    def _failed_sink(self, sk: str, ev: ScrobbleEvent) -> None:
+    def _failed_sink(self, sk: str, ev: ScrobbleEvent, *, ordered: bool = False) -> None:
         retry = self._retry_after.get(sk)
         attempts = min(5, (retry[1] if retry else 0) + 1)
         now = time.monotonic()
         self._retry_after[sk] = (now + min(300, 30 * 2 ** (attempts - 1)), attempts)
         self._last_action.pop(sk, None)
         self._last_progress.pop(sk, None)
-        self._queue_pending(sk, ev)
+        current = self._pending.get(sk)
+        if ordered:
+            # Consume the slot reserved before I/O; do not apply the incoming-event bound twice.
+            if current is None or current[1] is not ev:
+                if current:
+                    self._pending_tail.setdefault(sk, []).insert(0, current)
+                self._pending[sk] = (now, deepcopy(ev))
+                self._pending_ordered.add(sk)
+        else:
+            self._queue_pending(sk, ev)
 
     def _delivery_identity(self, cfg: dict[str, Any]) -> str:
         from providers.scrobble.routes import scrobble_sink_config
@@ -822,6 +884,8 @@ class Dispatcher:
                 if self._pending:
                     _log(f"route {self._route_label(cfg)}: cancelled {len(self._pending)} queued deliveries after destination or route configuration changed", "WARNING")
                 self._pending.clear()
+                self._pending_tail.clear()
+                self._pending_ordered.clear()
                 self._retry_after.clear()
                 self._session_ok.clear()
                 self._last_action.clear()
@@ -841,6 +905,9 @@ class Dispatcher:
         if retry_key is None:
             from cw_platform.event_archive.playback_recorder import prepare_playback, record_playback
 
+            if ev.action == "stop" and watch.get("route_sink") == "floppy" and ev.observed_at is None:
+                from services.playback_progress.models import utc_now_iso
+                ev = replace(ev, observed_at=utc_now_iso())
             ev = prepare_playback(ev)
             record_playback(ev, cfg)
         sent = False
@@ -848,17 +915,31 @@ class Dispatcher:
         queued = False
         for s in self._sinks:
             sk = self._session_key(s, ev)
+            ordered = watch.get("route_sink") == "floppy"
             with self._dispatch_lock:
                 if identity != self._config_identity:
                     return False
                 if retry_key is not None and (sk != retry_key or sk not in self._pending):
                     continue
                 if id(s) in self._inflight:
+                    admitted = True
                     if retry_key is None:
-                        self._queue_pending(sk, ev)
+                        admitted = self._queue_pending(sk, ev, ordered=ordered)
                         self._retry_after.setdefault(sk, (time.monotonic(), 0))
-                    queued = True
+                    queued = queued or admitted
+                    failed = failed or not admitted
                     continue
+                if ordered and retry_key is None and sk in self._pending:
+                    admitted = self._queue_pending(sk, ev, ordered=True)
+                    queued = queued or admitted
+                    failed = failed or not admitted
+                    continue
+                if ordered and retry_key is None:
+                    count = len(self._pending) + sum(len(v) for v in self._pending_tail.values())
+                    if count + len(self._inflight) >= 1024:
+                        _log("Floppy pending delivery queue is full; event was not admitted", "ERROR")
+                        failed = True
+                        continue
                 retry = self._retry_after.get(sk)
                 if retry and time.monotonic() < retry[0]:
                     if sk in self._pending and retry_key is None:
@@ -872,8 +953,7 @@ class Dispatcher:
                     self._last_progress.pop(sk, None)
                 if not self._should_send(ev, cfg, sk):
                     if retry_key is not None:
-                        self._pending.pop(sk, None)
-                        self._retry_after.pop(sk, None)
+                        self._advance_pending(sk)
                     continue
                 self._inflight.add(id(s))
             delivered = False
@@ -909,14 +989,13 @@ class Dispatcher:
                             self._last_progress.pop(expired, None)
                             self._debounce.pop(f"{expired}|pause", None)
                         if result.get("retryable", not result.get("skipped")):
-                            self._failed_sink(sk, pending[1] if newer and pending else ev)
+                            self._failed_sink(sk, ev if ordered else (pending[1] if newer and pending else ev), ordered=ordered)
                         elif newer:
                             self._last_action.pop(sk, None)
                             self._last_progress.pop(sk, None)
                             self._retry_after[sk] = (time.monotonic(), 0)
                         else:
-                            self._retry_after.pop(sk, None)
-                            self._pending.pop(sk, None)
+                            self._advance_pending(sk)
                         if log_delivery:
                             _log(f"route {self._route_label(cfg)}: failed {ev.action} "
                                  f"user={mask_account(ev.account)} sess={ev.session_key} "
@@ -930,8 +1009,7 @@ class Dispatcher:
                     if newer:
                         self._retry_after[sk] = (time.monotonic(), 0)
                     else:
-                        self._retry_after.pop(sk, None)
-                        self._pending.pop(sk, None)
+                        self._advance_pending(sk)
                     sent = True
                     skipped = isinstance(result, dict) and (bool(result.get("skipped")) or result.get("log_status") == "skipped")
                     if skipped and str((ev.raw or {}).get("_cw_playback_action") or ev.action) == "stop":

@@ -3,17 +3,23 @@
 # Copyright (c) 2025-2026 CrossWatch / Cenodude (https://github.com/cenodude/CrossWatch)
 from __future__ import annotations
 
+import json
+import sqlite3
 import time
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
+from requests import RequestException
+
 from cw_platform.event_archive import record_watch
+from cw_platform.local_db.db import LocalDatabaseError
 from cw_platform.local_db.ttl_dedupe import once_per_ttl
 from cw_platform.provider_instances import build_provider_config_view, normalize_instance_id
 from providers.auth._auth_FLOPPY import FloppyAuthError, FloppyClient, is_configured
 from providers.scrobble._auto_remove_watchlist import remove_across_providers_by_ids as _rm_across
+from providers.scrobble.floppy import completions
 from providers.scrobble.scrobble import ScrobbleEvent, ScrobbleSink, mask_account
 from providers.sync.floppy._common import api_post
 from services.activity import record_scrobble_event
@@ -194,7 +200,7 @@ def _payload(ev: ScrobbleEvent, watched_at: float = DEFAULT_WATCHED_AT) -> dict[
             complete = True
         if complete is not None:
             body["completed"] = complete
-        body["played_at"] = utc_now_iso()
+        body["played_at"] = ev.observed_at or utc_now_iso()
     return {k: v for k, v in body.items() if v not in (None, "", {}, [])}
 
 
@@ -246,6 +252,7 @@ def _auto_remove_across(ev: ScrobbleEvent, cfg: Mapping[str, Any], scope: str = 
 class FloppySink(ScrobbleSink):
     def __init__(self, cfg_provider: Callable[[], dict[str, Any]] | None = None, instance_id: str | None = None) -> None:
         self._cfg_provider = cfg_provider
+        self._poll_after = 0.0
         self._instance_id = normalize_instance_id(instance_id)
         self._completed: OrderedDict[str, tuple[float, str]] = OrderedDict()
 
@@ -296,6 +303,67 @@ class FloppySink(ScrobbleSink):
         while len(self._completed) > _COMPLETE_MAX:
             self._completed.popitem(last=False)
 
+    def _scope(self, cfg, view):
+        sc = cfg.get("scrobble") or {}
+        watch = {k: v for k, v in (sc.get("watch") or {}).items() if k != "routes"}
+        return completions.fingerprint([self._instance_id, view, watch, sc.get("floppy"),
+                                        sc.get("trakt"), cfg.get("anime_mapping"), cfg.get("pairs")])
+
+    @staticmethod
+    def _guarded_view(view):
+        return bool(view.get("verify_ssl")) and str(view.get("server_url") or "").startswith("https://")
+
+    def _deliver(self, row, ev, cfg, view):
+        src, src_inst = _route_source(cfg)
+        try:
+            first_ack = completions.deliver(_Adapter(self._client(view)), row)
+        except (FloppyAuthError, RequestException, OSError) as exc:
+            status = getattr(exc, "status_code", None)
+            reason = getattr(exc, "reason", None) or "request_failed"
+            if reason == "delivery_in_progress":
+                return {"ok": False, "error": reason, "retryable": True}
+            retry = reason == "request_failed" or status in (408, 429) or (isinstance(status, int) and status >= 500)
+            if completions.phase_for(row["event_id"]) not in ("probe", "guarded"):
+                retry = False
+            if retry:
+                completions.postpone(row)
+            else:
+                for phase in ("probe", "guarded"):
+                    completions.transition(row, phase, "held")
+            _log(f"scrobble failed status={status} reason={reason}", "ERROR")
+            record_watch(ev, action="stop", source_provider=src, source_instance=src_inst,
+                         destination_provider="floppy", destination_instance=self._instance_id,
+                         status="fail", progress=ev.progress, reason=reason)
+            # The persisted request can be retried independently of newer session activity.
+            # A mapped group also needs its caller to continue with later group members.
+            grouped = bool((ev.raw or {}).get("_cw_episode_group_delivery"))
+            return {"ok": False, "error": reason, "retryable": retry and grouped}
+        if not first_ack:
+            return {"ok": True, "log_status": "skipped", "reason": "session_completed"}
+        self._record_success(ev, cfg, "stop", ev.progress, True)
+        return {"ok": True}
+
+    def retry_completion(self):
+        now = time.monotonic()
+        if now < self._poll_after:
+            return
+        self._poll_after = now + 10
+        cfg = self._cfg()
+        watch = (cfg.get("scrobble") or {}).get("watch") or {}
+        if watch.get("route_enabled") is False:
+            return
+        view = self._view(cfg)
+        if not is_configured(view) or not self._guarded_view(view):
+            return
+        row = completions.next_due(self._scope(cfg, view))
+        if row is None:
+            return
+        fields = json.loads(row["event"])
+        group = fields.pop("group_delivery", None)
+        raw = {"_cw_episode_group_delivery": group} if group else {}
+        ev = ScrobbleEvent(action="stop", raw=raw, **fields)
+        self._deliver(row, ev, cfg, view)
+
     def send(self, ev: ScrobbleEvent, cfg: dict[str, Any] | None = None) -> dict[str, Any] | None:
         cfgd = self._cfg(cfg)
         view = self._view(cfgd)
@@ -309,6 +377,29 @@ class FloppySink(ScrobbleSink):
         complete_key = self._key(ev)
         progress = _clamp(ev.progress)
         is_complete_stop = body.get("action") == "stop" and body.get("completed") is True
+        coords = completions.target(ev) if self._guarded_view(view) else None
+        if coords and (is_complete_stop or (body["action"] == "start" and progress <= 2)):
+            scope = self._scope(cfgd, view)
+            watch = (cfgd.get("scrobble") or {}).get("watch") or {}
+            # The source identity survives a token rotation or a URL change. The separate
+            # scope pins any outstanding request to its original destination.
+            session = completions.fingerprint([_route_source(cfgd), watch.get("route_id"),
+                                               watch.get("route_effective_profile_id"), self._instance_id,
+                                               ev.server_uuid, ev.session_key, ev.account, coords])
+            try:
+                if is_complete_stop:
+                    if not completions.current_observation(body["played_at"]):
+                        _log("scrobble failed status=None reason=completion_time_outside_window", "ERROR")
+                        return {"ok": False, "error": "completion_time_outside_window", "retryable": False}
+                    row = completions.remember(scope, session, ev, body, coords)
+                    if row["scope"] != scope:
+                        _log("scrobble failed status=None reason=completion_route_changed", "ERROR")
+                        return {"ok": False, "error": "completion_route_changed", "retryable": False}
+                    return self._deliver(row, ev, cfgd, view)
+                completions.new_session(session)
+            except (LocalDatabaseError, sqlite3.Error):
+                _log("scrobble failed status=None reason=completion_journal_unavailable", "ERROR")
+                return {"ok": False, "error": "completion_journal_unavailable", "retryable": True}
         session_state = self._session_state(complete_key, str(body.get("action") or ""), progress)
         if is_complete_stop and session_state == "uncertain":
             return {"ok": False, "error": "completion_unconfirmed", "retryable": False}
@@ -336,9 +427,14 @@ class FloppySink(ScrobbleSink):
                 self._mark_session(complete_key, "uncertain")
             return {"ok": False, "error": "request_failed", "retryable": not is_complete_stop}
         action = str(body.get("action") or ev.action)
-        record_watch(ev, action=action, source_provider=src, source_instance=src_inst, destination_provider="floppy", destination_instance=self._instance_id, progress=progress)
-        if action == "stop" and body.get("completed") is True:
+        if is_complete_stop:
             self._mark_session(complete_key, "completed")
+        self._record_success(ev, cfgd, action, progress, is_complete_stop)
+
+    def _record_success(self, ev, cfgd, action, progress, is_complete_stop):
+        src, src_inst = _route_source(cfgd)
+        record_watch(ev, action=action, source_provider=src, source_instance=src_inst, destination_provider="floppy", destination_instance=self._instance_id, progress=progress)
+        if is_complete_stop:
             _auto_remove_across(ev, cfgd, scope=f"floppy:{self._instance_id}")
             try:
                 record_scrobble_event(ev, source=src, source_instance=src_inst, target="floppy", target_instance=self._instance_id, progress=progress)
